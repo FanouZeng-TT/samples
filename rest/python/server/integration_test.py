@@ -87,6 +87,31 @@ from ucp_sdk.models.schemas.shopping.types import (
 FLAGS = flags.FLAGS
 
 
+def _find_nulls(node: object, path: str = "") -> list[str]:
+  """Return the JSON-pointer path of every explicit `null` in a decoded body.
+
+  The order schema types unset optional fields as bare non-nullable
+  string/object/array, so under JSON Schema 2020-12 an explicit `null` is a
+  distinct type and fails validation the way an omitted key does not. A
+  response must OMIT an unset optional field, never emit `null` for it.
+  `Order.model_validate` (used by every other order test in this file, e.g.
+  test_shipping_event_matches_order_schema and
+  test_webhook_delivers_the_bare_order_as_body) cannot see this defect: the
+  generated pydantic model types every one of these fields
+  `Optional[...] = None`, so it accepts a `null` the wire schema forbids.
+  """
+  paths: list[str] = []
+  if node is None:
+    return [path or "/"]
+  if isinstance(node, dict):
+    for key, value in node.items():
+      paths.extend(_find_nulls(value, f"{path}/{key}"))
+  elif isinstance(node, list):
+    for index, value in enumerate(node):
+      paths.extend(_find_nulls(value, f"{path}/{index}"))
+  return paths
+
+
 class TestCheckout(
   BuyerConsentCheckoutResp,
   FulfillmentCheckout,
@@ -520,6 +545,170 @@ class IntegrationTest(absltest.TestCase):
           }
           for line_item in order_data["line_items"]
         ],
+      )
+
+  def test_get_order_omits_unset_optional_fields_as_null(self) -> None:
+    """GET /orders/{id} must omit unset optional fields, never emit null.
+
+    Mirrors #115/#117 (checkout responses null-padded unset optional
+    fields against the 2026-01-23 schema): the order route has the same
+    defect. Validated separately against the official ucp-schema validator
+    and an independent jsonschema referee, both spec corpora (2026-04-08,
+    2026-08-25); this in-repo test pins the narrower, dependency-free
+    signature -- no `null` anywhere in the response body.
+    """
+    with self.client:
+      payload = self._create_checkout_payload(
+        "order_get_nulls",
+        [("rose", "Red Rose", 1000, 2), ("tulip", "White Tulip", 800, 1)],
+      )
+      response = self.client.post(
+        "/checkout-sessions",
+        headers=self._get_headers(idempotency_key="ogn1", request_id="ogn1"),
+        json=payload.model_dump(mode="json", exclude_none=True),
+      )
+      self.assertEqual(response.status_code, 201, response.text)
+      checkout_sid = self.get_resource_id(response.json()["id"])
+
+      response = self.client.post(
+        f"/checkout-sessions/{checkout_sid}/complete",
+        headers=self._get_headers(idempotency_key="ogn2", request_id="ogn2"),
+        json=self._create_payment_payload(),
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+      order_id = response.json()["order"]["id"]
+
+      response = self.client.get(
+        f"/orders/{order_id}", headers=self._get_headers()
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+      null_paths = _find_nulls(response.json())
+      self.assertEqual(
+        null_paths,
+        [],
+        "order GET must omit unset optional fields, not emit null for them",
+      )
+
+  def test_update_order_omits_unset_optional_fields_as_null(self) -> None:
+    """PUT /orders/{id} must not write null-padded fields back to storage.
+
+    Companion to test_get_order_omits_unset_optional_fields_as_null: a fix
+    scoped only to the order's initial persist (inside complete_checkout)
+    would leave this update path free to reintroduce nulls on the very
+    next PUT -- the create/update-path split this suite exists to catch
+    (the shape of conformance#59 upstream: an issue named three sites, a
+    maintainer found the fourth of the same class).
+    """
+    with self.client:
+      payload = self._create_checkout_payload(
+        "order_put_nulls", [("rose", "Red Rose", 1000, 1)]
+      )
+      response = self.client.post(
+        "/checkout-sessions",
+        headers=self._get_headers(idempotency_key="opn1", request_id="opn1"),
+        json=payload.model_dump(mode="json", exclude_none=True),
+      )
+      self.assertEqual(response.status_code, 201, response.text)
+      checkout_sid = self.get_resource_id(response.json()["id"])
+
+      response = self.client.post(
+        f"/checkout-sessions/{checkout_sid}/complete",
+        headers=self._get_headers(idempotency_key="opn2", request_id="opn2"),
+        json=self._create_payment_payload(),
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+      order_id = response.json()["order"]["id"]
+
+      # Round-trip the order body through PUT unchanged (a real client
+      # updating one field would carry the rest of the order along, since
+      # the route is typed to accept a whole UnifiedOrder).
+      order_body = self.client.get(
+        f"/orders/{order_id}", headers=self._get_headers()
+      ).json()
+
+      response = self.client.put(
+        f"/orders/{order_id}",
+        headers=self._get_headers(idempotency_key="opn3", request_id="opn3"),
+        json=order_body,
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+      null_paths = _find_nulls(response.json())
+      self.assertEqual(
+        null_paths,
+        [],
+        "order PUT response must omit unset optional fields, not emit "
+        "null for them",
+      )
+
+      # And the stored copy the next GET serves must stay null-free too.
+      response = self.client.get(
+        f"/orders/{order_id}", headers=self._get_headers()
+      )
+      null_paths = _find_nulls(response.json())
+      self.assertEqual(
+        null_paths,
+        [],
+        "order PUT must not write null-padded fields back to storage",
+      )
+
+  def test_order_webhook_receiver_omits_unset_optional_fields_as_null(
+    self,
+  ) -> None:
+    """The order-event webhook receiver must not write nulls to storage.
+
+    A third site of the same class: `routes/ucp_implementation.py`'s
+    order_event_webhook parses an inbound partner Order payload and
+    persists `payload.model_dump(...)` directly. A partner naturally omits
+    unset optional fields; pydantic parses those as None, and dumping
+    without exclude_none writes them back as explicit null -- corrupting
+    storage the same way the create and update paths did, but reachable
+    without ever calling GET or PUT /orders/{id} first.
+    """
+    with self.client:
+      payload = self._create_checkout_payload(
+        "order_webhook_nulls", [("rose", "Red Rose", 1000, 1)]
+      )
+      response = self.client.post(
+        "/checkout-sessions",
+        headers=self._get_headers(idempotency_key="own1", request_id="own1"),
+        json=payload.model_dump(mode="json", exclude_none=True),
+      )
+      self.assertEqual(response.status_code, 201, response.text)
+      checkout_sid = self.get_resource_id(response.json()["id"])
+
+      response = self.client.post(
+        f"/checkout-sessions/{checkout_sid}/complete",
+        headers=self._get_headers(idempotency_key="own2", request_id="own2"),
+        json=self._create_payment_payload(),
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+      order_id = response.json()["order"]["id"]
+
+      # A partner's own event payload: only the fields it actually knows
+      # about, exactly as a real notifier would send it (the just-created,
+      # already null-free order body is the fixture: it naturally omits
+      # every unset optional field, so pydantic parses them as None on the
+      # way in).
+      order_body = self.client.get(
+        f"/orders/{order_id}", headers=self._get_headers()
+      ).json()
+
+      response = self.client.post(
+        "/webhooks/partners/partner_1/events/order",
+        headers=self._get_headers(),
+        json=order_body,
+      )
+      self.assertEqual(response.status_code, 200, response.text)
+
+      stored = self.client.get(
+        f"/orders/{order_id}", headers=self._get_headers()
+      ).json()
+      null_paths = _find_nulls(stored)
+      self.assertEqual(
+        null_paths,
+        [],
+        "the order-event webhook receiver must not write null-padded "
+        "fields back to storage",
       )
 
   def test_missing_ucp_agent_header(self) -> None:
@@ -1792,6 +1981,111 @@ class IntegrationTest(absltest.TestCase):
         msg.get("content", ""),
         "content must name the offending member",
       )
+
+  def test_update_applies_payment_instruments(self) -> None:
+    """An update carrying payment.instruments must apply them, not 500.
+
+    checkout.json marks `payment` as `ucp_request: {update: "optional"}`, and
+    checkout.md says submitting payment populates payment.instruments with
+    the collected instrument data -- update is a normal place for a platform
+    to submit payment. update_checkout built the response instead as
+    `PaymentResponse(instruments=checkout_req.payment.instruments)`, handing
+    the response model a list of
+    payment_instrument_update_request.SelectedPaymentInstrument instances.
+    The response model is typed for the sibling response class
+    payment_instrument.SelectedPaymentInstrument, so pydantic rejects the
+    construction as an unhandled ValidationError -- a bare 500, not the UCP
+    error envelope, whenever a request supplies a non-empty instruments
+    array. An update that omits payment (or sends instruments: []) never
+    exercises the mismatch, which is why this shipped unnoticed.
+    """
+    with self.client:
+      created = self.client.post(
+        "/checkout-sessions",
+        headers=self._get_headers(
+          idempotency_key="pay_upd_1", request_id="pay_upd_1"
+        ),
+        json={"line_items": [{"item": {"id": "rose"}, "quantity": 1}]},
+      )
+      self.assertEqual(created.status_code, 201, f"Response: {created.text}")
+      checkout_id = self.get_resource_id(created.json()["id"])
+
+      instrument = {
+        "id": "instr_upd_1",
+        "handler_id": "mock_payment_handler",
+        "type": "card",
+        "display": {"brand": "Visa", "last_digits": "4242"},
+        "selected": True,
+      }
+      updated = self.client.put(
+        f"/checkout-sessions/{checkout_id}",
+        headers=self._get_headers(
+          idempotency_key="pay_upd_2", request_id="pay_upd_2"
+        ),
+        json={
+          "line_items": [{"item": {"id": "rose"}, "quantity": 1}],
+          "payment": {"instruments": [instrument]},
+        },
+      )
+      self.assertEqual(
+        updated.status_code,
+        200,
+        f"an update carrying payment.instruments must not 500: {updated.text}",
+      )
+      returned = (updated.json().get("payment") or {}).get("instruments") or []
+      self.assertEqual(
+        len(returned), 1, "the submitted instrument must be applied"
+      )
+      self.assertEqual(returned[0].get("id"), "instr_upd_1")
+      self.assertEqual(returned[0].get("handler_id"), "mock_payment_handler")
+      self.assertEqual(returned[0].get("type"), "card")
+      self.assertEqual(
+        returned[0].get("display"),
+        {"brand": "Visa", "last_digits": "4242"},
+      )
+      self.assertTrue(returned[0].get("selected"))
+
+  def test_create_applies_payment_instruments(self) -> None:
+    """A create carrying payment.instruments must apply them, not 500.
+
+    Same class as test_update_applies_payment_instruments: create_checkout
+    builds `PaymentResponse(instruments=checkout_req.payment.instruments)`
+    from the create request, handing the response model a list of
+    payment_instrument_create_request.SelectedPaymentInstrument instances
+    instead of the response class it declares. Every existing create test
+    that touches payment sends `instruments: []`, so the mismatch never
+    triggers pydantic's model-type check.
+    """
+    with self.client:
+      instrument = {
+        "id": "instr_create_1",
+        "handler_id": "mock_payment_handler",
+        "type": "card",
+        "display": {"brand": "Visa", "last_digits": "4242"},
+        "selected": True,
+      }
+      response = self.client.post(
+        "/checkout-sessions",
+        headers=self._get_headers(
+          idempotency_key="pay_create_1", request_id="pay_create_1"
+        ),
+        json={
+          "line_items": [{"item": {"id": "rose"}, "quantity": 1}],
+          "payment": {"instruments": [instrument]},
+        },
+      )
+      self.assertEqual(
+        response.status_code,
+        201,
+        f"a create carrying payment.instruments must not 500: {response.text}",
+      )
+      returned = (response.json().get("payment") or {}).get("instruments") or []
+      self.assertEqual(
+        len(returned), 1, "the submitted instrument must be applied"
+      )
+      self.assertEqual(returned[0].get("id"), "instr_create_1")
+      self.assertEqual(returned[0].get("handler_id"), "mock_payment_handler")
+      self.assertEqual(returned[0].get("type"), "card")
 
 
 if __name__ == "__main__":
