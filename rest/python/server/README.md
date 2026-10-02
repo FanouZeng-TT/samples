@@ -199,7 +199,7 @@ Response:
           "spec": "https://ucp.dev/2026-04-08/specification/overview",
           "transport": "rest",
           "endpoint": "http://localhost:8182",
-          "schema": "https://ucp.dev/2026-04-08/services/shopping/openapi.json"
+          "schema": "https://ucp.dev/2026-04-08/services/shopping/rest.openapi.json"
         }
       ]
     },
@@ -316,18 +316,7 @@ Response:
           "config": {}
         }
       ]
-    },
-    "keys": [
-      {
-        "kty": "EC",
-        "crv": "P-256",
-        "kid": "<runtime-generated>",
-        "x": "<runtime-generated>",
-        "y": "<runtime-generated>",
-        "use": "sig",
-        "alg": "ES256"
-      }
-    ]
+    }
   },
   "signing_keys": [
     {
