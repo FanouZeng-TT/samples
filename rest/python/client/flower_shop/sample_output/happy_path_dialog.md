@@ -96,7 +96,7 @@ export RESPONSE=$(curl -s -X GET $SERVER_URL/.well-known/ucp)
       },
       {
         "version": "2026-01-23",
-        "spec": "https://ucp.dev/2026-01-23/specification/shopping/buyer_consent",
+        "spec": "https://ucp.dev/2026-01-23/specification/buyer-consent/",
         "schema": "https://ucp.dev/2026-01-23/schemas/shopping/buyer_consent.json",
         "extends": "dev.ucp.shopping.checkout"
       }
