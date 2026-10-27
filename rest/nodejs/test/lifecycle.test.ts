@@ -77,9 +77,14 @@ before(() => {
   db.prepare(
     "INSERT INTO products (id, title, price, image_url) VALUES (?, ?, ?, ?)"
   ).run("bouquet_roses", "Red Rose", 3500, "");
-  getTransactionsDb()
-    .prepare("INSERT INTO inventory (product_id, quantity) VALUES (?, ?)")
-    .run("bouquet_roses", 100);
+  db.prepare(
+    "INSERT INTO products (id, title, price, image_url) VALUES (?, ?, ?, ?)"
+  ).run("mug_blue", "Blue Mug", 1500, "");
+  const inventory = getTransactionsDb().prepare(
+    "INSERT INTO inventory (product_id, quantity) VALUES (?, ?)"
+  );
+  inventory.run("bouquet_roses", 100);
+  inventory.run("mug_blue", 100);
 });
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
@@ -135,8 +140,11 @@ async function complete(
 // with a known-customer shipping destination, then choose the quoted option)
 // and return its id ready to complete. See fulfillment.test.ts for the
 // dedicated coverage of that selection flow.
+type CheckoutItem = { id: string; quantity: number };
+
 async function createReadyToComplete(
-  app: ReturnType<typeof buildApp>
+  app: ReturnType<typeof buildApp>,
+  items: CheckoutItem[] = [{ id: "bouquet_roses", quantity: 1 }]
 ): Promise<string> {
   const created = (await (
     await app.request("/checkout-sessions", {
@@ -144,7 +152,10 @@ async function createReadyToComplete(
       headers: JSON_HEADERS,
       body: JSON.stringify({
         currency: "USD",
-        line_items: [{ item: { id: "bouquet_roses" }, quantity: 1 }],
+        line_items: items.map((item) => ({
+          item: { id: item.id },
+          quantity: item.quantity,
+        })),
         payment: {},
         buyer: { email: "john.doe@example.com" },
         fulfillment: {
@@ -154,6 +165,7 @@ async function createReadyToComplete(
     })
   ).json()) as {
     id: string;
+    line_items: { id: string; item: { id: string }; quantity: number }[];
     fulfillment: {
       methods: {
         groups: {
@@ -171,9 +183,11 @@ async function createReadyToComplete(
     headers: JSON_HEADERS,
     body: JSON.stringify({
       currency: "USD",
-      line_items: [
-        { id: "line_1", item: { id: "bouquet_roses" }, quantity: 1 },
-      ],
+      line_items: created.line_items.map((line) => ({
+        id: line.id,
+        item: { id: line.item.id },
+        quantity: line.quantity,
+      })),
       buyer: { email: "john.doe@example.com" },
       fulfillment: {
         methods: [
@@ -458,6 +472,67 @@ test("a checkout write failure rolls back the order and the reservation", async 
   ).json()) as { status: string; order?: unknown };
   assert.equal(checkout.status, "ready_for_complete");
   assert.equal(checkout.order, undefined, "no order reference may survive");
+});
+
+test("an out-of-stock second line rolls back the first reservation", async () => {
+  const app = buildApp();
+  const id = await createReadyToComplete(app, [
+    { id: "bouquet_roses", quantity: 1 },
+    { id: "mug_blue", quantity: 1 },
+  ]);
+  // The mug sells out between checkout creation and completion, so the first
+  // line is reserved and the second is not.
+  getTransactionsDb()
+    .prepare("UPDATE inventory SET quantity = 0 WHERE product_id = ?")
+    .run("mug_blue");
+  const rosesBefore = getInventory("bouquet_roses");
+  const ordersBefore = countRows("orders");
+
+  const res = await complete(app, id);
+  assert.equal(res.status, 409);
+
+  assert.equal(
+    getInventory("bouquet_roses"),
+    rosesBefore,
+    "the first line's reservation must roll back with the failure"
+  );
+  assert.equal(countRows("orders"), ordersBefore, "no order may be persisted");
+  const checkout = (await (
+    await app.request(`/checkout-sessions/${id}`)
+  ).json()) as { status: string };
+  assert.equal(checkout.status, "ready_for_complete");
+});
+
+test("an idempotent completion replay reserves stock once", async () => {
+  const app = buildApp();
+  const id = await createReadyToComplete(app);
+  const stockBefore = getInventory("bouquet_roses");
+  const ordersBefore = countRows("orders");
+  const headers = { ...JSON_HEADERS, "Idempotency-Key": "complete-replay" };
+  const body = JSON.stringify(SUCCESS_PAYMENT);
+
+  const first = await app.request(`/checkout-sessions/${id}/complete`, {
+    method: "POST",
+    headers,
+    body,
+  });
+  assert.equal(first.status, 200);
+
+  const replay = await app.request(`/checkout-sessions/${id}/complete`, {
+    method: "POST",
+    headers,
+    body,
+  });
+  assert.equal(replay.status, 200);
+  const replayed = (await replay.json()) as { status: string };
+  assert.equal(replayed.status, "completed");
+
+  assert.equal(
+    getInventory("bouquet_roses"),
+    (stockBefore ?? 0) - 1,
+    "a replayed completion must not reserve stock again"
+  );
+  assert.equal(countRows("orders"), ordersBefore + 1);
 });
 
 test("a successful completion reserves stock exactly once", async () => {

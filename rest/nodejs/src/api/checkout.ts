@@ -1163,15 +1163,22 @@ export class CheckoutService {
         currency: checkout.currency,
       };
 
-      // Reserve stock, persist the order and mark the checkout completed as
-      // one SQLite transaction: a failure at any step (including an order or
-      // checkout write) rolls the reservations back instead of leaving stock
-      // decremented behind a failed 500.
-      const outcome = runInTransaction(() => {
+      // Reserve stock, persist the order, mark the checkout completed and
+      // record the idempotent response as one SQLite transaction: a failure at
+      // any step — including a line item that runs out of stock after earlier
+      // lines were reserved — rolls every write back instead of leaving stock
+      // decremented behind a 409 or 500.
+      runInTransaction(() => {
         for (const line of checkout.line_items) {
           const product = getProduct(line.item.id);
+          // Throw rather than return: `db.transaction(fn)()` commits whenever
+          // the callback returns normally, so an early return here would
+          // commit the reservations made for the lines before this one.
           if (product && !reserveStock(line.item.id, line.quantity)) {
-            return { outOfStockItem: line.item.id };
+            throw new OutOfStockError(
+              `Item ${line.item.id} is out of stock`,
+              409
+            );
           }
         }
 
@@ -1183,18 +1190,19 @@ export class CheckoutService {
 
         saveOrder(order.id, order);
         saveCheckout(id, checkout.status, checkout);
-        return {};
-      });
 
-      if (outcome.outOfStockItem) {
-        return ucpErrorResponse(
-          c,
-          new OutOfStockError(
-            `Item ${outcome.outOfStockItem} is out of stock`,
-            409
-          )
-        );
-      }
+        // Recorded before the webhook so a retry that arrives while delivery
+        // is in flight replays this response instead of seeing `completed`
+        // and being answered 409.
+        if (idempotencyKey) {
+          saveIdempotencyRecord(
+            idempotencyKey,
+            requestHash,
+            200,
+            JSON.stringify(checkout)
+          );
+        }
+      });
 
       // Notify webhook (outside the transaction: external I/O must not hold
       // the SQLite write lock).
@@ -1204,17 +1212,11 @@ export class CheckoutService {
         new URL(c.req.url).origin
       );
 
-      if (idempotencyKey) {
-        saveIdempotencyRecord(
-          idempotencyKey,
-          requestHash,
-          200,
-          JSON.stringify(checkout)
-        );
-      }
-
       return c.json(checkout, 200);
     } catch (e) {
+      if (e instanceof UcpError) {
+        return ucpErrorResponse(c, e);
+      }
       console.error("Error completing checkout", e);
       return c.json({ detail: "Internal server error" }, 500);
     }
